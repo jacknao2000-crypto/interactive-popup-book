@@ -1,0 +1,56 @@
+name: Generate narration and publish
+on:
+  push:
+    branches: [main]
+    paths: ['index.html', 'lines.json', 'make_audio.py', '.github/workflows/publish.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: narrated-book-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install edge-tts==7.2.3
+      - run: python make_audio.py
+      - name: Verify all narration files
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          lines = json.loads(pathlib.Path('lines.json').read_text())['lines']
+          for line in lines:
+              path = pathlib.Path('audio') / (line['key'] + '.mp3')
+              assert path.is_file() and path.stat().st_size > 1000, str(path)
+          print(f'Validated {len(lines)} narration clips')
+          PY
+      - name: Save generated audio in repository
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add audio/
+          if ! git diff --cached --quiet; then
+            git commit -m 'Generate Microsoft narration audio'
+            git push
+          fi
+      - name: Prepare website
+        run: |
+          mkdir _site
+          cp index.html _site/
+          cp -r audio _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4

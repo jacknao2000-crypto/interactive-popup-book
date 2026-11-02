@@ -89,7 +89,7 @@
     background:rgba(255,248,238,.86);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-radius:30px;
     box-shadow:0 10px 30px rgba(20,8,0,.35);position:relative;z-index:2}
   #caption .txt{flex:1;min-width:0}
-  #story{font-size:18px;line-height:1.6;margin:0;min-height:28px}
+  #story{font-size:18px;line-height:1.6;margin:0;min-height:28px;cursor:pointer}
   #hint{display:flex;align-items:center;gap:7px;margin-top:4px;font-size:14px;color:#c4475a;font-family:system-ui,sans-serif;min-height:20px}
   #hint svg{flex:none}
   .nav{width:46px;height:46px;border-radius:50%;border:0;background:transparent;color:var(--ink);display:grid;place-items:center;cursor:pointer;flex:none;transition:transform .15s,background .2s,width .25s}
@@ -161,6 +161,7 @@
       <div id="hint"></div>
       <div id="dots"></div>
     </div>
+    <button class="nav" id="snd" aria-label="声音开关"></button>
     <button class="nav" id="next" aria-label="下一页"><svg width="20" height="20" viewBox="0 0 20 20"><path d="M7.5 4l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   </div>
 </div>
@@ -174,6 +175,121 @@ const piecesEl = $('#pieces'), decalsEl = $('#decals'), back = $('#back');
 const backdrop = $('#backdrop'), rear = $('#rear');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const EDGE = '#fffaf2';
+
+/* ---------- sound: synthesized SFX, pentatonic music box, narration ---------- */
+const SND = (() => {
+  let ctx=null, master=null, sfxBus=null, musBus=null, on=true, unlocked=false, musicTimer=null, lastSpoken='';
+  try { on = localStorage.getItem('bm_sound') !== 'off'; } catch(e){}
+  function ac(){
+    if (!ctx){
+      const A = window.AudioContext || window.webkitAudioContext; if (!A) return null;
+      ctx = new A(); master = ctx.createGain(); master.gain.value = on ? 1 : 0; master.connect(ctx.destination);
+      sfxBus = ctx.createGain(); sfxBus.gain.value = .9; sfxBus.connect(master);
+      musBus = ctx.createGain(); musBus.gain.value = .32; musBus.connect(master);
+    }
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+  let nbuf=null;
+  function noiseBuf(){ if(nbuf) return nbuf; const c=ctx; nbuf=c.createBuffer(1,c.sampleRate*1.5,c.sampleRate); const d=nbuf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; return nbuf; }
+  function noise(dur,{f=1500,f2=null,q=1,type='bandpass',vol=.3,at=.004,delay=0}={}){
+    const c=ac(); if(!c||!on) return; const t=c.currentTime+delay;
+    const src=c.createBufferSource(); src.buffer=noiseBuf();
+    const fl=c.createBiquadFilter(); fl.type=type; fl.Q.value=q; fl.frequency.setValueAtTime(f,t); if(f2) fl.frequency.exponentialRampToValueAtTime(f2,t+dur);
+    const g=c.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+at); g.gain.exponentialRampToValueAtTime(.0008,t+dur);
+    src.connect(fl).connect(g).connect(sfxBus); src.start(t, Math.random()); src.stop(t+dur+.05);
+  }
+  function tone(freq,dur,{type='sine',vol=.25,slide=null,delay=0,at=.006,bus=null}={}){
+    const c=ac(); if(!c||!on) return; const t=c.currentTime+delay;
+    const o=c.createOscillator(); o.type=type; o.frequency.setValueAtTime(freq,t); if(slide) o.frequency.exponentialRampToValueAtTime(slide,t+dur*.9);
+    const g=c.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+at); g.gain.exponentialRampToValueAtTime(.0008,t+dur);
+    o.connect(g).connect(bus||sfxBus); o.start(t); o.stop(t+dur+.05);
+  }
+  // C major pentatonic, gentle
+  const PENTA=[523.25,587.33,659.25,783.99,880,1046.5,1174.66,1318.5];
+  const arp=(idx,step=.07,vol=.14,type='triangle')=>idx.forEach((k,i)=>tone(PENTA[k],.35,{type,vol,delay:i*step}));
+  function music(start){
+    clearTimeout(musicTimer); if(!start) return;
+    let i=0, pos=2;
+    const bass=[130.81,98,110,87.31];
+    const tick=()=>{
+      if(!on){ musicTimer=setTimeout(tick,600); return; }
+      if(i%8===0) tone(bass[(i/8)%4|0],2.6,{type:'sine',vol:.11,bus:musBus,at:.08});
+      if(Math.random()<.82){ pos=Math.max(0,Math.min(7,pos+[-2,-1,-1,0,1,1,2][Math.random()*7|0]));
+        tone(PENTA[pos],1.1,{type:'sine',vol:.09,bus:musBus}); tone(PENTA[pos]*2,.5,{type:'sine',vol:.015,bus:musBus}); }
+      i++; musicTimer=setTimeout(tick, i%4===0?620:420);
+    };
+    musicTimer=setTimeout(tick,300);
+  }
+  // narration: prefer pre-generated Microsoft neural voice files (audio/*.mp3), else browser voices (Edge: Xiaoxiao / Yunjian)
+  const clean = t => t.replace(/<[^>]+>/g,'').replace(/[“”]/g,'').trim();
+  const keyOf = t => { let h=5381; for (const ch of t) h=((h*33)^ch.codePointAt(0))>>>0; return h.toString(16); };
+  let narr=null, man=null, files=null;
+  function pickVoice(){ try{
+    const v=speechSynthesis.getVoices().filter(x=>/^zh[-_](CN|Hans)/i.test(x.lang)||/^zh$/i.test(x.lang));
+    const pref=(res)=>{ for(const r of res){ const f=v.find(x=>r.test(x.name)); if(f) return f; } return null; };
+    narr = pref([/Xiaoxiao.*(Natural|Online)/i,/Xiaoyi.*(Natural|Online)/i,/(Natural|Online)/i,/Xiaoxiao|Tingting|Ting-Ting|Huihui|female|女/i]) || v[0] || null;
+    man  = pref([/Yunjian.*(Natural|Online)/i,/Yunyang.*(Natural|Online)/i,/Yunxi.*(Natural|Online)/i,/Kangkang|Yunyang|male|男/i]) || narr;
+  }catch(e){} }
+  try{ pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }catch(e){}
+  const natural = v => v && /Natural|Online/i.test(v.name);
+  let cur=null, queue=[];
+  window.__spoken = [];
+  function stopAll(){ queue=[]; if(cur){ try{cur.pause();}catch(e){} cur=null; } try{speechSynthesis.cancel();}catch(e){} }
+  function playNext(){
+    if(cur || !queue.length) return;
+    const k=queue.shift(); const a=new Audio('audio/'+k+'.mp3'); cur=a;
+    const done=()=>{ if(cur===a){ cur=null; playNext(); } };
+    a.onended=done; a.onerror=done; a.play().catch(done);
+  }
+  function speak(text,{who='narr',interrupt=false}={}){
+    if(!on||!unlocked) return; const t=clean(text); if(!t) return; const k=keyOf(t);
+    window.__spoken.push({k,t,who});
+    if(interrupt) stopAll();
+    if(files && files.has(k)){ queue.push(k); playNext(); return; }
+    try{
+      const v = who==='man' ? man : narr;
+      const u=new SpeechSynthesisUtterance(t); u.lang='zh-CN'; if(v) u.voice=v;
+      u.rate = natural(v) ? 1 : (who==='man' ? .95 : .88);
+      u.pitch = natural(v) ? 1 : (who==='man' ? .8 : 1.1);
+      speechSynthesis.speak(u);
+    }catch(e){}
+  }
+  function loadFiles(){ try{ fetch('audio/lines.json').then(r=>r.ok?r.json():null).then(j=>{ if(j&&j.lines) files=new Set(j.lines.map(l=>l.key)); }).catch(()=>{}); }catch(e){} }
+  const api = {
+    get on(){ return on; },
+    unlock(){ if(unlocked) return; unlocked=true; ac(); music(true); },
+    toggle(){ on=!on; try{localStorage.setItem('bm_sound',on?'on':'off');}catch(e){}
+      if(ctx) master.gain.setTargetAtTime(on?1:0, ctx.currentTime, .05);
+      if(!on){ stopAll(); } else { ac(); if(lastSpoken) speak(lastSpoken,{interrupt:true}); }
+      return on; },
+    story(text){ const t=clean(text); if(t===lastSpoken) return; lastSpoken=t; speak(t,{interrupt:true}); },
+    replay(){ if(lastSpoken) speak(lastSpoken,{interrupt:true}); },
+    line(text){ speak(text,{who:'man'}); },
+    loadFiles,
+    hush(){ stopAll(); },
+    tick(){ tone(1400,.05,{type:'triangle',vol:.06}); },
+    pop(i=0){ noise(.07,{f:1800+Math.random()*900,q:2.5,vol:.16}); tone(320+i*12,.09,{type:'triangle',vol:.05}); },
+    flip(){ noise(.45,{f:500,f2:3500,q:.8,vol:.22,at:.08}); noise(.12,{f:180,type:'lowpass',vol:.25,delay:.38}); },
+    open(){ noise(.7,{f:300,f2:2600,q:.7,vol:.25,at:.15}); noise(.16,{f:150,type:'lowpass',vol:.35,delay:.62}); arp([2,4,5,7],.09,.08,'sine'); },
+    close(){ noise(.5,{f:2600,f2:300,q:.7,vol:.22,at:.05}); noise(.18,{f:140,type:'lowpass',vol:.4,delay:.42}); },
+    plant(){ tone(190,.16,{type:'sine',vol:.35,slide:120}); noise(.09,{f:700,q:1.5,vol:.2}); tone(PENTA[3+(Math.random()*3|0)],.3,{type:'triangle',vol:.08,delay:.1}); },
+    pull(){ noise(.22,{f:2500,f2:6000,type:'highpass',q:.5,vol:.18}); tone(260,.32,{type:'triangle',vol:.22,slide:820}); },
+    sparkle(){ arp([4,5,6,7],.05,.07,'sine'); },
+    drip(){ tone(1100+Math.random()*500,.08,{type:'sine',vol:.08,slide:600}); },
+    gulp(){ [0,1,2].forEach(k=>tone(420+k*90,.12,{type:'sine',vol:.12,slide:700+k*80,delay:k*.09})); },
+    night(){ noise(.6,{f:900,f2:250,q:.6,vol:.12,at:.2}); tone(196,.7,{type:'sine',vol:.08}); },
+    day(){ arp([0,2,4],.12,.12,'triangle'); },
+    wilt(){ tone(392,.9,{type:'triangle',vol:.14,slide:180}); tone(311,1,{type:'sine',vol:.08,slide:150,delay:.15}); },
+    card(){ noise(.25,{f:1200,f2:3000,q:1,vol:.12}); },
+    good(){ arp([2,4,5],.1,.1,'triangle'); },
+    sad(){ tone(330,.35,{type:'triangle',vol:.12}); tone(262,.5,{type:'triangle',vol:.12,delay:.25}); },
+    finale(happy){ if(happy){ arp([0,2,4,5,7],.12,.13,'triangle'); arp([4,7],.12,.08,'sine'); } else this.sad(); }
+  };
+  return api;
+})();
+addEventListener('pointerdown', () => SND.unlock(), { capture:true });
+SND.loadFiles();
 
 function fit(){
   const wrap = $('#stageWrap').getBoundingClientRect();
@@ -446,7 +562,7 @@ function setFold(p,folded){
 }
 async function popAll(){
   const order = [...pieces].sort((a,b)=>a.z-b.z);
-  for (const p of order){ setFold(p,false); await sleep(70); }
+  let k=0; for (const p of order){ setFold(p,false); SND.pop(k++); await sleep(70); }
 }
 async function foldAll(){
   const order = [...pieces].sort((a,b)=>b.z-a.z);
@@ -494,7 +610,7 @@ function setFarmer(pose,mood){ if(farmer) farmer.el.innerHTML = farmerSVG(pose,m
 /* ---------- UI helpers ---------- */
 const story = $('#story'), hint = $('#hint');
 const HAND = `<svg width="18" height="18" viewBox="0 0 24 24"><path d="M9 11V5.5a1.5 1.5 0 0 1 3 0V11m0-1.5a1.5 1.5 0 0 1 3 0V11m0-.5a1.5 1.5 0 0 1 3 0V15a6 6 0 0 1-6 6h-1a6 6 0 0 1-5-2.7L4.3 15a1.5 1.5 0 0 1 2.4-1.8L9 15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-function setText(t,h){ story.innerHTML = t; hint.innerHTML = h ? HAND + `<span>${h}</span>` : ''; }
+function setText(t,h){ story.innerHTML = t; SND.story(t); hint.innerHTML = h ? HAND + `<span>${h}</span>` : ''; }
 function ready(on=true){ $('#next').classList.toggle('ready',on); }
 let bubbleTimer;
 function say(text, el = farmer && farmer.el, ms=2600){
@@ -506,7 +622,7 @@ function say(text, el = farmer && farmer.el, ms=2600){
   $('#ui').appendChild(b);
   const bw = b.offsetWidth, uw = u.width, cx = parseFloat(b.style.left);
   b.style.left = Math.max(bw/2+8, Math.min(uw-bw/2-8, cx)) + 'px';
-  requestAnimationFrame(()=>b.classList.add('show'));
+  requestAnimationFrame(()=>b.classList.add('show')); SND.line(text);
   clearTimeout(bubbleTimer); bubbleTimer = setTimeout(()=>{b.classList.remove('show'); setTimeout(()=>b.remove(),300)}, ms);
 }
 function floatText(text, el){
@@ -571,7 +687,7 @@ const PAGES = [
         for (let i=0;i<XS.length;i++){
           setFarmer('bend','smile'); farmer.el.style.left = (XS[i]-60-70)+'px';
           await sleep(260);
-          S.back[i].pull = 30; S.back[i].pulled = true; redrawSeed('back',i,{g:S.back[i].g,pull:30});
+          SND.pull(); S.back[i].pull = 30; S.back[i].pulled = true; redrawSeed('back',i,{g:S.back[i].g,pull:30});
           floatText('长高啦！', seedPieces.back[i].el);
           await sleep(320); setFarmer('stand','smile');
         }
@@ -595,7 +711,7 @@ const PAGES = [
       setText('第二天一早，农夫的儿子跑到田里一看——拔高的禾苗全都蔫了！' + (pulledFront===0 ? '前排你没拔的禾苗，倒是又长高了一点。' : ''), '点一棵禾苗，看看泥土下面发生了什么');
       ready(S.lookedRoot);
     },
-    async after(){ await sleep(500); say('哎呀！怎么都蔫了？'); }
+    async after(){ SND.wilt(); await sleep(500); say('哎呀！怎么都蔫了？'); }
   },
   { name:'结果', sky:'gold',
     build(){
@@ -612,12 +728,12 @@ const PAGES = [
       $('#again').onclick = () => { reset(); go(1, true); };
       ready(false);
     },
-    async after(){ if (S.front.some(s=>!s.pulled)) { await sleep(500); say('没拔的禾苗，长得最好！'); } }
+    async after(){ SND.finale(S.front.some(s=>!s.pulled)); if (S.front.some(s=>!s.pulled)) { await sleep(500); say('没拔的禾苗，长得最好！'); } }
   }
 ];
 
 function plant(row,i){
-  const s = S[row][i]; s.planted = true; s.g = 0;
+  const s = S[row][i]; s.planted = true; s.g = 0; SND.plant();
   const x = XS[i], z = ROW[row];
   shadow(x,z,70);
   const p = addPiece({x,z,w:90,h:230,html:`<div class="hit" style="width:100%;height:100%">${seedlingSVG({g:0})}</div>`,cls:'seed',data:{row,i}});
@@ -650,11 +766,11 @@ function setupSun(){
 }
 function placeSun(t){ sunT=t; if(!sunEl) return; sunEl.style.left = (60 + t*800)+'px'; sunEl.style.top = (150 - Math.sin(t*Math.PI)*90)+'px'; }
 async function nextDay(){
-  const night = $('#night'); night.style.opacity = .7; await sleep(450);
+  const night = $('#night'); night.style.opacity = .7; SND.night(); await sleep(450);
   S.day++; [...S.back,...S.front].forEach(s=> s.g = Math.min(.2, s.g + .05));
   for (const row of ['back','front']) S[row].forEach((s,i)=>redrawSeed(row,i,{g:s.g}));
   placeSun(0); $('#day').textContent = `第 ${S.day} 天`;
-  night.style.opacity = 0; await sleep(400);
+  night.style.opacity = 0; SND.day(); await sleep(400);
   const lines = ['嗯……好像长高了一点点？','怎么长得这么慢呀？','唉，要等到什么时候呀！'];
   say(lines[Math.min(S.day-2, lines.length-1)]);
   if (S.day>=4){ ready(true); setText('农夫天天到田边看。禾苗长得真慢呀，好像一点也没长高。农夫急得团团转。', '翻到下一页，看看农夫想了什么办法'); }
@@ -667,7 +783,7 @@ function armPull(p,i){
   p.el.addEventListener('pointermove', e=>{ if(!drag) return; const s=S.front[i]; s.pull = Math.max(0,Math.min(40,(sy-e.clientY)*.55)); redrawSeed('front',i,{g:s.g,pull:s.pull}); });
   p.el.addEventListener('pointerup', ()=>{ if(!drag) return; drag=false; p.el.style.cursor='';
     const s=S.front[i];
-    if (s.pull>12){ s.pull=30; s.pulled=true; p.el.classList.remove('can-pull'); floatText('长高啦！',p.el);
+    if (s.pull>12){ SND.pull(); setTimeout(()=>SND.sparkle(),250); s.pull=30; s.pulled=true; p.el.classList.remove('can-pull'); floatText('长高啦！',p.el);
       if(!S.praised){ S.praised=true; setTimeout(()=>say('看，一下子就长高了！'),300); } }
     else s.pull=0;
     redrawSeed('front',i,{g:s.g,pull:s.pull});
@@ -699,9 +815,9 @@ function setupCan(){
   });
   const end = ()=>{ if(!drag) return; drag=false; clearInterval(pouring); pouring=null; target=-1; can.classList.remove('drag'); home(); };
   can.addEventListener('pointerup', end); can.addEventListener('pointercancel', end);
-  function drip(){ const sp=spout(), u=ui.getBoundingClientRect();
+  function drip(){ SND.drip(); const sp=spout(), u=ui.getBoundingClientRect();
     for(let k=0;k<2;k++){ const d=document.createElement('div'); d.className='drop'; d.style.left=(sp.x-u.left+Math.random()*10-5)+'px'; d.style.top=(sp.y-u.top+6)+'px'; ui.appendChild(d); setTimeout(()=>d.remove(),720);} }
-  function water(i){ const s=S.front[i]; if(s.watered) return; s.watered=true; const w=$('#wet'+i); if(w) w.classList.add('on'); floatText('喝饱啦', seedPieces.front[i].el); }
+  function water(i){ const s=S.front[i]; if(s.watered) return; s.watered=true; SND.gulp(); const w=$('#wet'+i); if(w) w.classList.add('on'); floatText('喝饱啦', seedPieces.front[i].el); }
 }
 
 function rootArt(s){
@@ -728,7 +844,8 @@ function showRoot(row,i){
   $('#cardText').innerHTML = s.pulled
     ? (s.watered ? '虽然浇了水，可是<b>根已经离开了泥土</b>，喝不到水，所以蔫了。' : '往上一拔，<b>根就离开了泥土</b>，喝不到水，也吸不到养分，所以蔫了。')
     : '根还<b>扎在泥土里</b>，能喝到水，过了一夜，又悄悄长高了一点。';
-  $('#card').classList.add('show');
+  $('#card').classList.add('show'); SND.card(); setTimeout(()=> s.pulled ? SND.sad() : SND.good(), 250);
+  SND.story($('#cardText').innerHTML);
   if (!S.lookedRoot){ S.lookedRoot = true; }
 }
 $('#cardClose').onclick = () => { $('#card').classList.remove('show'); if(S.page===4){ ready(true); hint.innerHTML = HAND + '<span>再点点别的禾苗，比一比；看完翻到下一页</span>'; } };
@@ -742,8 +859,9 @@ async function go(n, fromEnd){
   if (S.page===1 && n>1) plantAll();
   const wasCover = S.page===0 && !fromEnd;
   const scene = $('#scene');
-  if (wasCover){ scene.classList.remove('closed'); await sleep(700); }
+  if (wasCover){ scene.classList.remove('closed'); SND.open(); await sleep(700); }
   if (!wasCover){
+    if (n===0) SND.close(); else SND.flip();
     await foldAll();
     back.classList.remove('cover'); rear.innerHTML = '';
     back.style.transform = 'rotateX(-90deg)';
@@ -768,6 +886,11 @@ async function go(n, fromEnd){
   busy=false;
 }
 $('#next').onclick = () => go(S.page+1);
+const SPK_ON = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>`;
+const SPK_OFF = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9l5 6M22 9l-5 6"/></svg>`;
+const sndBtn = $('#snd'); const paintSnd = () => { sndBtn.innerHTML = SND.on ? SPK_ON : SPK_OFF; sndBtn.setAttribute('aria-pressed', SND.on); };
+paintSnd(); sndBtn.onclick = () => { SND.unlock(); SND.toggle(); paintSnd(); };
+story.onclick = () => SND.replay();
 $('#prev').onclick = () => go(S.page-1);
 
 rear.innerHTML = coverSVG();
@@ -780,4 +903,3 @@ window.__go = go; window.__S = () => S;
 </script>
 </body>
 </html>
-
